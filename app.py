@@ -2,8 +2,9 @@ import os
 import requests
 import uuid
 import pyodbc
+import json
 import traceback
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from openai import AzureOpenAI
 from azure.core.credentials import AzureKeyCredential
@@ -18,21 +19,15 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 
 load_dotenv()
-
 app = Flask(__name__)
 
+# Key Vault
 KEY_VAULT_NAME = os.environ.get("KEY_VAULT_NAME")
 KV_URL = f"https://{KEY_VAULT_NAME}.vault.azure.net/"
 credential = DefaultAzureCredential()
 secret_client = SecretClient(vault_url=KV_URL, credential=credential)
 
-AZURE_CLIENT_ID = secret_client.get_secret("AZURE-CLIENT-ID").value
-AZURE_TENANT_ID = secret_client.get_secret("AZURE-TENANT-ID").value
-AZURE_CLIENT_SECRETS = secret_client.get_secret("AZURE-CLIENT-SECRETS").value
-os.environ["AZURE-CLIENT-ID"] = AZURE_CLIENT_ID
-os.environ["AZURE-TENANT-ID"] = AZURE_TENANT_ID
-os.environ["AZURE-CLIENT-SECRETS"] = AZURE_CLIENT_SECRETS
-
+# Secrets
 VISION_KEY = secret_client.get_secret("COMPUTER-VISION-KEY").value
 VISION_ENDPOINT = secret_client.get_secret("COMPUTER-VISION-ENDPOINT").value
 FORM_RECOGNIZER_KEY = secret_client.get_secret("FORM-RECOGNIZER-KEY").value
@@ -41,24 +36,29 @@ COSMOS_DB_URI = secret_client.get_secret("COSMOS-ENDPOINT").value
 COSMOS_DB_KEY = secret_client.get_secret("COSMOS-KEY").value
 COSMOS_DB_DATABASE = secret_client.get_secret("COSMOS-DB-NAME").value
 COSMOS_DB_CONTAINER = secret_client.get_secret("COSMOS-CONTAINER-NAME").value
-LOGIC_APP_WEBHOOK_URL = secret_client.get_secret("LOGIC-APP-WEBHOOK-URL").value
 GPT_API_KEY = secret_client.get_secret("AZURE-OPENAI-KEY").value
 AZURE_OPENAI_ENDPOINT = secret_client.get_secret("AZURE-OPENAI-ENDPOINT").value
 BLOB_CONNECTION_STRING = secret_client.get_secret("BLOB-CONNECTION-STRING").value
 BLOB_CONTAINER_NAME = secret_client.get_secret("BLOB-CONTAINER-NAME").value
-
 SQL_SERVER = secret_client.get_secret("SQL-SERVER").value
 SQL_DATABASE = secret_client.get_secret("SQL-DATABASE").value
 SQL_USERNAME = secret_client.get_secret("SQL-USERNAME").value
 SQL_PASSWORD = secret_client.get_secret("SQL-PASSWORD").value
+LOGIC_APP_WEBHOOK_URL = secret_client.get_secret("LOGIC-APP-WEBHOOK-URL").value
 
+# Azure Clients
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
+form_recognizer = DocumentAnalysisClient(FORM_RECOGNIZER_ENDPOINT, AzureKeyCredential(FORM_RECOGNIZER_KEY))
+vision_client = ComputerVisionClient(VISION_ENDPOINT, CognitiveServicesCredentials(VISION_KEY))
+cosmos_client = CosmosClient(COSMOS_DB_URI, credential=COSMOS_DB_KEY)
+container = cosmos_client.get_database_client(COSMOS_DB_DATABASE).get_container_client(COSMOS_DB_CONTAINER)
+openai_client = AzureOpenAI(api_key=GPT_API_KEY, api_version="2024-02-15-preview", azure_endpoint=AZURE_OPENAI_ENDPOINT)
 
+# SQL
 sql_connection_string = (
     f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-    f"SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};"
-    f"UID={SQL_USERNAME};PWD={SQL_PASSWORD}"
+    f"SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};UID={SQL_USERNAME};PWD={SQL_PASSWORD}"
 )
 try:
     sql_conn = pyodbc.connect(sql_connection_string)
@@ -66,26 +66,20 @@ try:
 except Exception as e:
     print("❌ SQL connection failed:", e)
 
-form_recognizer = DocumentAnalysisClient(FORM_RECOGNIZER_ENDPOINT, AzureKeyCredential(FORM_RECOGNIZER_KEY))
-vision_client = ComputerVisionClient(VISION_ENDPOINT, CognitiveServicesCredentials(VISION_KEY))
-cosmos_client = CosmosClient(COSMOS_DB_URI, credential=COSMOS_DB_KEY)
-container = cosmos_client.get_database_client(COSMOS_DB_DATABASE).get_container_client(COSMOS_DB_CONTAINER)
-openai_client = AzureOpenAI(api_key=GPT_API_KEY, api_version="2024-02-15-preview", azure_endpoint=AZURE_OPENAI_ENDPOINT)
-
 def validate_claim(name, email):
     try:
+        print(f"🔍 Validating claim for: {name}, {email}")
         cursor = sql_conn.cursor()
         cursor.execute("""
             SELECT c.CustomerID, p.PolicyID
             FROM Customers c
             JOIN Policies p ON c.CustomerID = p.CustomerID
-            WHERE c.Name = ? AND c.Email = ? AND p.Status = 'Active'
+            WHERE LOWER(c.Name) = LOWER(?) AND LOWER(c.Email) = LOWER(?) AND p.Status = 'Active'
         """, (name, email))
         result = cursor.fetchone()
         if result:
             return {"isValid": True, "customerId": result[0], "policyId": result[1]}
-        else:
-            return {"isValid": False}
+        return {"isValid": False}
     except Exception as e:
         print("❌ SQL validation error:", str(e))
         return {"isValid": False}
@@ -100,122 +94,87 @@ def submit_claim():
         name = request.form.get("name")
         email = request.form.get("email")
         description = request.form.get("accidentDescription")
-        policy_id = request.form.get("policyId")
         accident_date = request.form.get("accidentDate")
         vehicle_model = request.form.get("vehicleModel")
-        car_photos = request.files.getlist("carPhotos")
-        supporting_docs = request.files.getlist("supportingDocuments")
-        files = car_photos + supporting_docs
+        files = request.files.getlist("carPhotos") + request.files.getlist("supportingDocuments")
 
         if not files or all(f.filename == "" for f in files):
             return jsonify({"status": "error", "message": "No files uploaded."}), 400
 
-        # 🔍 Validate policy
-        validation_result = validate_claim(name, email)
-        if not validation_result["isValid"]:
+        validation = validate_claim(name, email)
+        if not validation["isValid"]:
             return jsonify({"status": "error", "message": "User does not have a valid policy."}), 400
 
-        customer_id = validation_result["customerId"]
-        policy_id = validation_result["policyId"]
         claim_id = str(uuid.uuid4())
+        customer_id = validation["customerId"]
+        policy_id = validation["policyId"]
         document_details = []
 
         for file in files:
-            try:
-                form_data_dict = {}
-                filename = secure_filename(file.filename)
-                blob_client = container_client.get_blob_client(filename)
-                blob_client.upload_blob(file.stream, overwrite=True)
-                blob_url = blob_client.url
-
-                sas_token = generate_blob_sas(
-                    account_name=blob_service_client.account_name,
-                    container_name=BLOB_CONTAINER_NAME,
-                    blob_name=filename,
-                    account_key=blob_service_client.credential.account_key,
-                    permission=BlobSasPermissions(read=True),
-                    expiry=datetime.now(tz=timezone.utc) + timedelta(minutes=15)
-                )
-                blob_url_with_sas = f"{blob_url}?{sas_token}"
-                print(f"✅ Uploaded to blob with SAS: {blob_url_with_sas}")
-
-                # Computer Vision
-                try:
-                    vision_result = vision_client.describe_image(blob_url_with_sas, max_candidates=1)
-                    caption = vision_result.captions[0].text if vision_result.captions else "No caption detected"
-                except Exception as e:
-                    caption = f"Vision error: {str(e)}"
-                    print("❌ Computer Vision failed:", caption)
-
-                # Form Recognizer
-                try:
-                    poller = form_recognizer.begin_analyze_document_from_url("prebuilt-document", blob_url_with_sas)
-                    result = poller.result()
-                    for kv in result.key_value_pairs:
-                        key = kv.key.content.strip() if kv.key and kv.key.content else ""
-                        value = kv.value.content.strip() if kv.value and kv.value.content else ""
-                        if key:
-                            form_data_dict[key] = value
-                except Exception as e:
-                    form_data_dict = {"error": f"Recognizer error: {str(e)}"}
-                    print("❌ Form Recognizer failed:", form_data_dict)
-
-                # OPTIONAL SQL insert (DISABLED if fields mismatch)
-                try:
-                    # Ensure your table has FileUrl and DocumentType fields before re-enabling this
-                    cursor = sql_conn.cursor()
-                    cursor.execute("""
-                        INSERT INTO Documents (ClaimID, DocumentType, FileName, FileUrl)
-                        VALUES (?, ?, ?, ?)
-                    """, (claim_id, "Photo", filename, blob_url_with_sas))
-                    sql_conn.commit()
-                except Exception as e:
-                    print("❌ SQL insert error for document:", str(e))
-
-                document_details.append({
-                    "file": filename,
-                    "caption": caption,
-                    "formData": form_data_dict,
-                    "blobUrl": blob_url_with_sas
-                })
-
-            except Exception as e:
-                print("❌ Error processing file:", str(e))
-                traceback.print_exc()
-
-        # GPT-4 Analysis
-        severity = "Unknown"
-        estimated_cost = "Unknown"
-        gpt_output_text = "GPT analysis unavailable due to error"
-        try:
-            gpt_prompt = (
-                f"Analyze the following vehicle accident description and estimate the severity and approximate cost of repair.\n\n"
-                f"Description: {description}\n\n"
-                f"Respond in this JSON format:\n"
-                f'{{"severity": "Low|Medium|High", "estimated_cost": "$XXXX"}}'
+            filename = secure_filename(file.filename)
+            blob_client = container_client.get_blob_client(filename)
+            blob_client.upload_blob(file.stream, overwrite=True)
+            blob_url = blob_client.url
+            sas_token = generate_blob_sas(
+                account_name=blob_service_client.account_name,
+                container_name=BLOB_CONTAINER_NAME,
+                blob_name=filename,
+                account_key=blob_service_client.credential.account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.now(timezone.utc) + timedelta(minutes=15)
             )
+            blob_url_with_sas = f"{blob_url}?{sas_token}"
+            print(f"✅ Uploaded to blob with SAS: {blob_url_with_sas}")
 
+            caption = "No caption detected"
+            try:
+                vision_result = vision_client.describe_image(blob_url_with_sas, max_candidates=1)
+                if vision_result.captions:
+                    caption = vision_result.captions[0].text
+            except Exception as e:
+                print("❌ Vision error:", e)
+
+            form_data = {}
+            try:
+                poller = form_recognizer.begin_analyze_document_from_url("prebuilt-document", blob_url_with_sas)
+                result = poller.result()
+                for kv in result.key_value_pairs:
+                    key = kv.key.content.strip() if kv.key and kv.key.content else ""
+                    value = kv.value.content.strip() if kv.value and kv.value.content else ""
+                    if key:
+                        form_data[key] = value
+            except Exception as e:
+                form_data = {"error": f"Recognizer error: {str(e)}"}
+                print("❌ Form Recognizer error:", form_data)
+
+            document_details.append({
+                "file": filename,
+                "caption": caption,
+                "formData": form_data,
+                "blobUrl": blob_url_with_sas
+            })
+
+        # GPT Summary
+        gpt_summary = "GPT summary unavailable due to error"
+        gpt_prompt = (
+            f"Summarize the following vehicle accident report clearly and concisely so it can be cross-validated with visual damage evidence:\n\n"
+            f"{description}"
+        )
+        try:
             gpt_response = openai_client.chat.completions.create(
-                model="gpt-4o-39",  # ✅ Update if needed
+                model="gpt-4o-39",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant skilled in analyzing accident reports."},
+                    {"role": "system", "content": "You are a helpful assistant summarizing vehicle accident claims."},
                     {"role": "user", "content": gpt_prompt}
                 ],
                 temperature=0.3,
             )
-
-            gpt_output_text = gpt_response.choices[0].message.content.strip()
-            print("🧠 GPT Output:", gpt_output_text)
-
-            gpt_data = json.loads(gpt_output_text)
-            severity = gpt_data.get("severity", "Unknown")
-            estimated_cost = gpt_data.get("estimated_cost", "Unknown")
-
+            gpt_summary = gpt_response.choices[0].message.content.strip()
+            print("🧠 GPT Summary:", gpt_summary)
         except Exception as e:
-            print("❌ GPT-4 analysis failed:", str(e))
+            print("❌ GPT summary error:", str(e))
             traceback.print_exc()
 
-        # Cosmos DB entry
         claim_data = {
             "id": claim_id,
             "name": name,
@@ -225,34 +184,26 @@ def submit_claim():
             "accidentDate": accident_date,
             "vehicleModel": vehicle_model,
             "description": description,
-            "severity": severity,
-            "estimatedCost": estimated_cost,
-            "gptOutputRaw": gpt_output_text,
+            "gptSummary": gpt_summary,
             "documents": document_details,
             "status": "Submitted"
         }
 
-        try:
-            container.upsert_item(claim_data)
-            print("✅ Claim stored in Cosmos DB.")
-        except Exception as e:
-            print("❌ Cosmos DB write failed:", str(e))
-            traceback.print_exc()
+        container.upsert_item(claim_data)
+        print("✅ Claim stored in Cosmos DB.")
 
-        # Trigger Logic App
         try:
             if LOGIC_APP_WEBHOOK_URL:
                 requests.post(LOGIC_APP_WEBHOOK_URL, json=claim_data)
         except Exception as e:
             print("❌ Logic App webhook failed:", str(e))
-            traceback.print_exc()
 
         return render_template("success.html", message="Claim submitted successfully.", claim_id=claim_id)
 
     except Exception as e:
         print("❌ General error in submit_claim:", str(e))
         traceback.print_exc()
-        return jsonify({"status": "error", "message": "Internal error occurred."}), 500
+        return jsonify({"status": "error", "message": "Internal Server Error"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)

@@ -2,6 +2,7 @@ import os
 import requests
 import uuid
 import pyodbc
+import traceback
 from flask import Flask, request, jsonify, render_template, redirect, url_for
 from werkzeug.utils import secure_filename
 from openai import AzureOpenAI
@@ -109,6 +110,7 @@ def submit_claim():
         if not files or all(f.filename == "" for f in files):
             return jsonify({"status": "error", "message": "No files uploaded."}), 400
 
+        # 🔍 Validate policy
         validation_result = validate_claim(name, email)
         if not validation_result["isValid"]:
             return jsonify({"status": "error", "message": "User does not have a valid policy."}), 400
@@ -119,7 +121,7 @@ def submit_claim():
         document_details = []
 
         for file in files:
-            if file:
+            try:
                 form_data_dict = {}
                 filename = secure_filename(file.filename)
                 blob_client = container_client.get_blob_client(filename)
@@ -137,6 +139,7 @@ def submit_claim():
                 blob_url_with_sas = f"{blob_url}?{sas_token}"
                 print(f"✅ Uploaded to blob with SAS: {blob_url_with_sas}")
 
+                # Computer Vision
                 try:
                     vision_result = vision_client.describe_image(blob_url_with_sas, max_candidates=1)
                     caption = vision_result.captions[0].text if vision_result.captions else "No caption detected"
@@ -144,10 +147,10 @@ def submit_claim():
                     caption = f"Vision error: {str(e)}"
                     print("❌ Computer Vision failed:", caption)
 
+                # Form Recognizer
                 try:
                     poller = form_recognizer.begin_analyze_document_from_url("prebuilt-document", blob_url_with_sas)
                     result = poller.result()
-                    form_data_dict = {}
                     for kv in result.key_value_pairs:
                         key = kv.key.content.strip() if kv.key and kv.key.content else ""
                         value = kv.value.content.strip() if kv.value and kv.value.content else ""
@@ -157,7 +160,9 @@ def submit_claim():
                     form_data_dict = {"error": f"Recognizer error: {str(e)}"}
                     print("❌ Form Recognizer failed:", form_data_dict)
 
+                # OPTIONAL SQL insert (DISABLED if fields mismatch)
                 try:
+                    # Ensure your table has FileUrl and DocumentType fields before re-enabling this
                     cursor = sql_conn.cursor()
                     cursor.execute("""
                         INSERT INTO Documents (ClaimID, DocumentType, FileName, FileUrl)
@@ -168,12 +173,49 @@ def submit_claim():
                     print("❌ SQL insert error for document:", str(e))
 
                 document_details.append({
-					"file": filename, 
-					"caption": caption, 
-					"formData": form_data_dict, 
-					"blobUrl": blob_url_with_sas
-				})
+                    "file": filename,
+                    "caption": caption,
+                    "formData": form_data_dict,
+                    "blobUrl": blob_url_with_sas
+                })
 
+            except Exception as e:
+                print("❌ Error processing file:", str(e))
+                traceback.print_exc()
+
+        # GPT-4 Analysis
+        severity = "Unknown"
+        estimated_cost = "Unknown"
+        gpt_output_text = "GPT analysis unavailable due to error"
+        try:
+            gpt_prompt = (
+                f"Analyze the following vehicle accident description and estimate the severity and approximate cost of repair.\n\n"
+                f"Description: {description}\n\n"
+                f"Respond in this JSON format:\n"
+                f'{{"severity": "Low|Medium|High", "estimated_cost": "$XXXX"}}'
+            )
+
+            gpt_response = openai_client.chat.completions.create(
+                model="gpt-4o-39",  # ✅ Update if needed
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant skilled in analyzing accident reports."},
+                    {"role": "user", "content": gpt_prompt}
+                ],
+                temperature=0.3,
+            )
+
+            gpt_output_text = gpt_response.choices[0].message.content.strip()
+            print("🧠 GPT Output:", gpt_output_text)
+
+            gpt_data = json.loads(gpt_output_text)
+            severity = gpt_data.get("severity", "Unknown")
+            estimated_cost = gpt_data.get("estimated_cost", "Unknown")
+
+        except Exception as e:
+            print("❌ GPT-4 analysis failed:", str(e))
+            traceback.print_exc()
+
+        # Cosmos DB entry
         claim_data = {
             "id": claim_id,
             "name": name,
@@ -183,6 +225,9 @@ def submit_claim():
             "accidentDate": accident_date,
             "vehicleModel": vehicle_model,
             "description": description,
+            "severity": severity,
+            "estimatedCost": estimated_cost,
+            "gptOutputRaw": gpt_output_text,
             "documents": document_details,
             "status": "Submitted"
         }
@@ -192,18 +237,22 @@ def submit_claim():
             print("✅ Claim stored in Cosmos DB.")
         except Exception as e:
             print("❌ Cosmos DB write failed:", str(e))
+            traceback.print_exc()
 
+        # Trigger Logic App
         try:
             if LOGIC_APP_WEBHOOK_URL:
                 requests.post(LOGIC_APP_WEBHOOK_URL, json=claim_data)
         except Exception as e:
             print("❌ Logic App webhook failed:", str(e))
+            traceback.print_exc()
 
         return render_template("success.html", message="Claim submitted successfully.", claim_id=claim_id)
 
     except Exception as e:
         print("❌ General error in submit_claim:", str(e))
-        return jsonify({"status": "error", "message": str(e)}), 500
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": "Internal error occurred."}), 500
 
 if __name__ == "__main__":
     app.run(debug=True)

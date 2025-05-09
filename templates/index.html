@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Insurance Claim Submission</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>Insurance Claim Form</h1>
+    <form id="claimForm" method="POST" action="/submit-claim" enctype="multipart/form-data">
+      <!-- Personal Information -->
+      <fieldset>
+        <legend>Personal Information</legend>
+        <label for="name">Full Name:</label>
+        <input type="text" id="name" name="name" required><br>
+
+        <label for="email">Email Address:</label>
+        <input type="email" id="email" name="email" required><br>
+
+        <label for="phone">Phone Number:</label>
+        <input type="tel" id="phone" name="phone" required><br>
+      </fieldset>
+
+      <!-- Claim Details -->
+      <fieldset>
+        <legend>Claim Details</legend>
+        <label for="policyId">Policy ID:</label>
+        <input type="number" id="policyId" name="policyId" required><br>
+
+        <label for="accidentDate">Date of Accident:</label>
+        <input type="date" id="accidentDate" name="accidentDate" required><br>
+
+        <label for="accidentDescription">Accident Description:</label><br>
+        <textarea id="accidentDescription" name="accidentDescription" rows="4" required></textarea><br>
+
+        <label for="vehicleModel">Vehicle Model:</label>
+        <input type="text" id="vehicleModel" name="vehicleModel" required><br>
+      </fieldset>
+
+      <!-- Supporting Documents Upload -->
+      <fieldset>
+        <legend>Supporting Documents (Insurance Card etc.)</legend>
+        <label for="supportingDocuments">Upload Supporting Documents:</label>
+        <input type="file" id="supportingDocuments" name="supportingDocuments" multiple><br>
+      </fieldset>
+
+      <!-- Car Damage Photos Upload -->
+      <fieldset>
+        <legend>Car Damage Photos</legend>
+        <label for="carPhotos">Upload Car Damage Photos:</label>
+        <input type="file" id="carPhotos" name="carPhotos" multiple><br>
+      </fieldset>
+
+      <!-- Terms and Conditions -->
+      <fieldset>
+        <label>
+          <input type="checkbox" id="terms" name="terms" required>
+          I agree to the terms and conditions.
+        </label><br>
+      </fieldset>
+
+      <!-- Submit Button -->
+      <button type="submit">Submit Claim</button>
+    </form>
+  </div>
+</body>
+</html>

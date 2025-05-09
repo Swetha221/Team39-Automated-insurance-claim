@@ -21,13 +21,13 @@ from datetime import datetime, timedelta, timezone
 load_dotenv()
 app = Flask(__name__)
 
-# Azure Key Vault
+# Key Vault
 KEY_VAULT_NAME = os.environ.get("KEY_VAULT_NAME")
 KV_URL = f"https://{KEY_VAULT_NAME}.vault.azure.net/"
 credential = DefaultAzureCredential()
 secret_client = SecretClient(vault_url=KV_URL, credential=credential)
 
-# Load secrets
+# Secrets
 VISION_KEY = secret_client.get_secret("COMPUTER-VISION-KEY").value
 VISION_ENDPOINT = secret_client.get_secret("COMPUTER-VISION-ENDPOINT").value
 FORM_RECOGNIZER_KEY = secret_client.get_secret("FORM-RECOGNIZER-KEY").value
@@ -46,7 +46,7 @@ SQL_USERNAME = secret_client.get_secret("SQL-USERNAME").value
 SQL_PASSWORD = secret_client.get_secret("SQL-PASSWORD").value
 LOGIC_APP_WEBHOOK_URL = secret_client.get_secret("LOGIC-APP-WEBHOOK-URL").value
 
-# Azure clients
+# Azure Clients
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
 container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
 form_recognizer = DocumentAnalysisClient(FORM_RECOGNIZER_ENDPOINT, AzureKeyCredential(FORM_RECOGNIZER_KEY))
@@ -55,7 +55,7 @@ cosmos_client = CosmosClient(COSMOS_DB_URI, credential=COSMOS_DB_KEY)
 container = cosmos_client.get_database_client(COSMOS_DB_DATABASE).get_container_client(COSMOS_DB_CONTAINER)
 openai_client = AzureOpenAI(api_key=GPT_API_KEY, api_version="2024-02-15-preview", azure_endpoint=AZURE_OPENAI_ENDPOINT)
 
-# SQL connection
+# SQL
 sql_connection_string = (
     f"DRIVER={{ODBC Driver 17 for SQL Server}};"
     f"SERVER={SQL_SERVER};DATABASE={SQL_DATABASE};UID={SQL_USERNAME};PWD={SQL_PASSWORD}"
@@ -68,6 +68,7 @@ except Exception as e:
 
 def validate_claim(name, email):
     try:
+        print(f"🔍 Validating claim for: {name}, {email}")
         cursor = sql_conn.cursor()
         cursor.execute("""
             SELECT c.CustomerID, p.PolicyID
@@ -78,9 +79,10 @@ def validate_claim(name, email):
         result = cursor.fetchone()
         if result:
             return {"isValid": True, "customerId": result[0], "policyId": result[1]}
+        return {"isValid": False}
     except Exception as e:
         print("❌ SQL validation error:", str(e))
-    return {"isValid": False}
+        return {"isValid": False}
 
 @app.route("/", methods=["GET"])
 def serve_form():
@@ -103,9 +105,9 @@ def submit_claim():
         if not validation["isValid"]:
             return jsonify({"status": "error", "message": "User does not have a valid policy."}), 400
 
+        claim_id = str(uuid.uuid4())
         customer_id = validation["customerId"]
         policy_id = validation["policyId"]
-        claim_id = str(uuid.uuid4())
         document_details = []
 
         for file in files:
@@ -122,6 +124,7 @@ def submit_claim():
                 expiry=datetime.now(timezone.utc) + timedelta(minutes=15)
             )
             blob_url_with_sas = f"{blob_url}?{sas_token}"
+            print(f"✅ Uploaded to blob with SAS: {blob_url_with_sas}")
 
             caption = "No caption detected"
             try:
@@ -129,7 +132,7 @@ def submit_claim():
                 if vision_result.captions:
                     caption = vision_result.captions[0].text
             except Exception as e:
-                print("❌ Computer Vision failed:", e)
+                print("❌ Vision error:", e)
 
             form_data = {}
             try:
@@ -142,17 +145,7 @@ def submit_claim():
                         form_data[key] = value
             except Exception as e:
                 form_data = {"error": f"Recognizer error: {str(e)}"}
-                print("❌ Form Recognizer failed:", form_data)
-
-            try:
-                cursor = sql_conn.cursor()
-                cursor.execute("""
-                    INSERT INTO Documents (ClaimID, DocumentType, FileName, FileUrl)
-                    VALUES (?, ?, ?, ?)
-                """, (claim_id, "Photo", filename, blob_url_with_sas))
-                sql_conn.commit()
-            except Exception as e:
-                print("❌ SQL insert error for document:", str(e))
+                print("❌ Form Recognizer error:", form_data)
 
             document_details.append({
                 "file": filename,
@@ -161,8 +154,8 @@ def submit_claim():
                 "blobUrl": blob_url_with_sas
             })
 
-        # GPT-4 summary analysis
-        gpt_summary = "Summary not available due to error."
+        # GPT Summary
+        gpt_summary = "GPT summary unavailable due to error"
         gpt_prompt = (
             f"Summarize the following vehicle accident report clearly and concisely so it can be cross-validated with visual damage evidence:\n\n"
             f"{description}"

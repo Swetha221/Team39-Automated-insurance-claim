@@ -1,0 +1,62 @@
+# .github/workflows/azure-deploy.yml
+
+name: Build and deploy Python app to Azure Web App - Automated-Insurance-claim-app
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: 'Production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify requirements.txt exists
+        run: |
+          if [ ! -f requirements.txt ]; then
+            echo "requirements.txt not found!"
+            exit 1
+          fi
+
+      - name: Zip code for deployment
+        run: zip -r release.zip . -x "venv/*" ".git/*" ".github/*"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-app
+          path: release.zip
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-app
+
+      - name: Unzip artifact
+        run: unzip release.zip
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_68DB8060A6064825981CF2B4B7E2389B }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_B7C481A27A4B40F18AC02C88A22821EA }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_CCC0D0E01625480A8D04BC58CB1A1CCE }}
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        id: deploy-to-webapp
+        with:
+          app-name: 'Automated-Insurance-claim-app'
+          slot-name: 'Production'
+          package: .
